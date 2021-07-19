@@ -93,6 +93,7 @@ type RespMeta struct {
 // ApiClient is PowerStore API client interface
 type ApiClient interface {
 	Traceable
+	QueryBulk(ctx context.Context) ([]byte, error)
 	Query(
 		ctx context.Context,
 		cfg RequestConfigRenderer,
@@ -209,6 +210,88 @@ func (c *ClientIMPL) SetCustomHTTPHeaders(headers http.Header) {
 func (c *ClientIMPL) SetLogger(logger Logger) {
 	c.logger = logger
 	c.apiThrottle.SetLogger(logger)
+}
+
+const (
+	bulkApiEnable = "latest_five_min_metrics/enable"
+	bulkApiDownload = "latest_five_min_metrics/download"
+)
+
+//QueryBulk method call bulk api
+func (c *ClientIMPL) QueryBulk(
+	ctx context.Context) ([]byte, error) {
+
+	var cancelFuncPtr *func()
+	ctx, cancelFuncPtr = c.setupContext(ctx)
+	if cancelFuncPtr != nil {
+		defer (*cancelFuncPtr)()
+	}
+
+	traceMsg := c.prepareTraceMsg(ctx)
+
+	requestURL, err := c.prepareRequestURL(bulkApiEnable, "", "", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := c.prepareRequest(ctx, "POST", requestURL, traceMsg, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := c.apiThrottle.Acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer c.apiThrottle.Release(ctx)
+
+	r, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	//Then download
+	header := make(http.Header)
+	header.Add("Accept", "*/*")
+	header.Add("Accept-Encoding", "gzip, deflate, br")
+	header.Add("If-None-Match", "esa.tar.gz")
+	header.Add("Content-Length", "0")
+	header.Add("Connection", "keep-alive")
+
+	c.customHTTPHeaders = header
+
+	requestURL, err = c.prepareRequestURL(bulkApiDownload, "", "", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err = c.prepareRequest(ctx, "POST", requestURL, traceMsg, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := c.apiThrottle.Acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer c.apiThrottle.Release(ctx)
+
+	c.customHTTPHeaders = nil
+
+	r, err = c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Body.Close()
+
+	switch {
+	case r.StatusCode >= 200 && r.StatusCode < 300:
+		resp, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		return resp, nil
+	default:
+		return nil, buildError(r)
+	}
 }
 
 // Query method do http request and reads response to provided struct
