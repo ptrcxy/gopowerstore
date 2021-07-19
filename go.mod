@@ -9,3 +9,7 @@ require (
 	github.com/sirupsen/logrus v1.4.2
 	github.com/stretchr/testify v1.6.1
 )
+
+replace (
+	github.com/dell/gopowerstore => ./gopowerstore
+)
