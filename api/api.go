@@ -93,6 +93,8 @@ type RespMeta struct {
 // ApiClient is PowerStore API client interface
 type ApiClient interface {
 	Traceable
+	EnableBulk(ctx context.Context) (RespMeta, error)
+	DownloadBulk(ctx context.Context, etag string) (int, string, []byte, error)
 	Query(
 		ctx context.Context,
 		cfg RequestConfigRenderer,
@@ -209,6 +211,109 @@ func (c *ClientIMPL) SetCustomHTTPHeaders(headers http.Header) {
 func (c *ClientIMPL) SetLogger(logger Logger) {
 	c.logger = logger
 	c.apiThrottle.SetLogger(logger)
+}
+
+const (
+	bulkApiEnable   = "latest_five_min_metrics/enable"
+	bulkApiDownload = "latest_five_min_metrics/download"
+)
+
+// EnableBulk enable bulk function
+func (c *ClientIMPL) EnableBulk(ctx context.Context) (RespMeta, error) {
+	meta := RespMeta{}
+	var cancelFuncPtr *func()
+	ctx, cancelFuncPtr = c.setupContext(ctx)
+	if cancelFuncPtr != nil {
+		defer (*cancelFuncPtr)()
+	}
+	traceMsg := c.prepareTraceMsg(ctx)
+
+	requestURL, err := c.prepareRequestURL(bulkApiEnable, "", "", nil)
+	if err != nil {
+		return meta, err
+	}
+
+	req, err := c.prepareRequest(ctx, "POST", requestURL, traceMsg, nil)
+	if err != nil {
+		return meta, err
+	}
+
+	if err := c.apiThrottle.Acquire(ctx); err != nil {
+		return meta, err
+	}
+	defer c.apiThrottle.Release(ctx)
+
+	r, err := c.httpClient.Do(req)
+	if err != nil {
+		return meta, err
+	}
+	defer r.Body.Close()
+
+	meta.Status = r.StatusCode
+
+	if r.StatusCode >= 200 && r.StatusCode < 300 {
+		return meta, nil
+	} else {
+		return meta, buildError(r)
+	}
+}
+
+// DownloadBulk method call bulk api, return status code, etag, bytes
+func (c *ClientIMPL) DownloadBulk(
+	ctx context.Context, etag string) (int, string, []byte, error) {
+
+	var cancelFuncPtr *func()
+	ctx, cancelFuncPtr = c.setupContext(ctx)
+	if cancelFuncPtr != nil {
+		defer (*cancelFuncPtr)()
+	}
+
+	traceMsg := c.prepareTraceMsg(ctx)
+
+	// Then download
+	header := make(http.Header)
+	header.Add("Accept", "*/*")
+	header.Add("Accept-Encoding", "gzip, deflate, br")
+	header.Add("If-None-Match", etag)
+	header.Add("Content-Length", "0")
+	header.Add("Connection", "keep-alive")
+
+	c.customHTTPHeaders = header
+
+	requestURL, err := c.prepareRequestURL(bulkApiDownload, "", "", nil)
+	if err != nil {
+		return 0, "", nil, err
+	}
+
+	req, err := c.prepareRequest(ctx, "POST", requestURL, traceMsg, nil)
+	if err != nil {
+		return 0, "", nil, err
+	}
+
+	if err := c.apiThrottle.Acquire(ctx); err != nil {
+		return 0, "", nil, err
+	}
+	defer c.apiThrottle.Release(ctx)
+
+	c.customHTTPHeaders = nil
+
+	r, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, "", nil, err
+	}
+	defer r.Body.Close()
+
+	switch {
+	case r.StatusCode >= 200 && r.StatusCode < 300:
+		resp, err := io.ReadAll(r.Body)
+		if err != nil {
+			return 0, "", nil, err
+		}
+		return r.StatusCode, r.Header.Get("ETag"), resp, nil
+	default:
+		// When status code is other than 200
+		return r.StatusCode, r.Header.Get("ETag"), nil, buildError(r)
+	}
 }
 
 // Query method do http request and reads response to provided struct
